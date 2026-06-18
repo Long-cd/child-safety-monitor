@@ -19,6 +19,9 @@ public:
                    const uint8_t* img1, uint32_t len1,
                    const uint8_t* img2, uint32_t len2);
 
+    // lightweight heartbeat to detect disconnect
+    int  sendHeartbeat();
+
 private:
     int  m_sock;
     int  sendAll(const void* data, uint32_t len);

@@ -1,9 +1,13 @@
 #include "yolov8_seg.h"
 #include "danger_monitor.h"
 #include "image_utils.h"
+#include "image_convert.h"
+#include "nlohmann_json.hpp"
 #include <cstdio>
 #include <cmath>
 #include <sys/stat.h>
+
+using json = nlohmann::json;
 
 static void ensureDir(const std::string& path) {
     mkdir(path.c_str(), 0755);
@@ -75,12 +79,14 @@ int analyze_danger(pose_detect_result_list* pose_results, int pose_ret,
         }
     }
 
-    // ---- distance transform to find nearest object pixel ----
-    cv::Mat dist2D;
+    // ---- distance transform + nearest pixel labels ----
+    cv::Mat dist2D, nearestLabels;
     if (!objMask.empty() && cv::countNonZero(objMask) > 0) {
         cv::Mat invMask;
         cv::bitwise_not(objMask, invMask);
-        cv::distanceTransform(invMask, dist2D, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+        cv::distanceTransform(invMask, dist2D, nearestLabels,
+                              cv::DIST_L2, cv::DIST_MASK_PRECISE,
+                              cv::DIST_LABEL_PIXEL);
     }
 
     // ---- collect object class names ----
@@ -137,30 +143,19 @@ int analyze_danger(pose_detect_result_list* pose_results, int pose_ret,
             }
             if (cv::countNonZero(windowMask) > 0) {
                 float nx = det->keypoints[0][0], ny = det->keypoints[0][1];
-                // find nearest window pixel to nose
-                cv::Mat winDist;
-                cv::Mat winInv;
+                // nearest window pixel via distance transform labels
+                cv::Mat winDist, winLabels, winInv;
+                int imgW = src_img->width;
                 cv::bitwise_not(windowMask, winInv);
-                cv::distanceTransform(winInv, winDist, cv::DIST_L2, cv::DIST_MASK_PRECISE);
-                float d2d = winDist.at<float>((int)ny, (int)nx);
+                cv::distanceTransform(winInv, winDist, winLabels,
+                                      cv::DIST_L2, cv::DIST_MASK_PRECISE,
+                                      cv::DIST_LABEL_PIXEL);
+                int ix = (int)(nx + 0.5f), iy = (int)(ny + 0.5f);
+                int label = winLabels.at<int>(iy, ix);
+                int best_wy = label / imgW;
+                int best_wx = label % imgW;
 
-                int rx = (int)(nx + 0.5f), ry = (int)(ny + 0.5f);
-                int best_wx = -1, best_wy = -1;
-                float best_d2 = 1e9f;
-                int r = (int)(d2d + 6.0f);
-                for (int dy = -r; dy <= r; dy++) {
-                    int wy = ry + dy;
-                    if (wy < 0 || wy >= img_h) continue;
-                    for (int dx = -r; dx <= r; dx++) {
-                        int wx = rx + dx;
-                        if (wx < 0 || wx >= src_img->width) continue;
-                        if (windowMask.at<uint8_t>(wy, wx) == 0) continue;
-                        float sd = sqrtf((float)(dx*dx + dy*dy));
-                        if (sd < best_d2) { best_d2 = sd; best_wx = wx; best_wy = wy; }
-                    }
-                }
-
-                if (best_wx >= 0) {
+                if (best_wx >= 0 && best_wx < imgW && best_wy >= 0 && best_wy < img_h) {
                     float Z_nose   = depthAt(depth_map, nx, ny);
                     float Z_window = depthAt(depth_map, (float)best_wx, (float)best_wy);
                     if (Z_nose > 0 && Z_window > 0) {
@@ -179,38 +174,28 @@ int analyze_danger(pose_detect_result_list* pose_results, int pose_ret,
             if (!windowMask.empty()) windowMask.release();
         }
 
-        // ---- proximity check ----
-        if (!dist2D.empty()) {
+        // ---- proximity check (uses distance transform labels) ----
+        if (!dist2D.empty() && !nearestLabels.empty()) {
+            int imgW = src_img->width;
             for (int k = 0; k < PROXIMITY_KP_NUM; k++) {
                 int kp_id = PROXIMITY_KP[k];
                 float kx = det->keypoints[kp_id][0];
                 float ky = det->keypoints[kp_id][1];
                 float kc = det->keypoints[kp_id][2];
                 if (kc < KP_CONF_THRESHOLD) continue;
-                if (kx < 0 || kx >= src_img->width || ky < 0 || ky >= img_h) continue;
+                if (kx < 0 || kx >= imgW || ky < 0 || ky >= img_h) continue;
 
                 // 2D pixel distance to nearest object
-                float d2d = dist2D.at<float>((int)ky, (int)kx);
+                int ix = (int)(kx + 0.5f), iy = (int)(ky + 0.5f);
+                float d2d = dist2D.at<float>(iy, ix);
                 if (d2d > SEARCH_RADIUS_PX) continue;
 
-                // find exact nearest object pixel
-                int rx = (int)(kx + 0.5f), ry = (int)(ky + 0.5f);
-                int best_ox = -1, best_oy = -1;
-                float best_d2 = 1e9f;
-                int r = (int)(d2d + 4.0f);
-                for (int dy = -r; dy <= r; dy++) {
-                    int ny = ry + dy;
-                    if (ny < 0 || ny >= img_h) continue;
-                    for (int dx = -r; dx <= r; dx++) {
-                        int nx = rx + dx;
-                        if (nx < 0 || nx >= src_img->width) continue;
-                        if (objMask.at<uint8_t>(ny, nx) == 0) continue;
-                        float sd = sqrtf((float)(dx*dx + dy*dy));
-                        if (sd < best_d2) { best_d2 = sd; best_ox = nx; best_oy = ny; }
-                    }
-                }
+                // nearest object pixel via precomputed label (linear index)
+                int label = nearestLabels.at<int>(iy, ix);
+                int best_oy = label / imgW;
+                int best_ox = label % imgW;
 
-                if (best_ox < 0) continue;
+                if (best_ox < 0 || best_ox >= imgW || best_oy < 0 || best_oy >= img_h) continue;
 
                 // 3D positions
                 float Z_kp  = depthAt(depth_map, kx, ky);
@@ -270,19 +255,10 @@ void save_danger_frame(const DangerReport& report,
     char fname[256];
     snprintf(fname, sizeof(fname), "%s/frame_%05d", out_dir.c_str(), report.frame_id);
 
-    // save annotated image (BGR → RGB → jpg via OpenCV)
+    // save annotated image
     std::string img_path = std::string(fname) + ".jpg";
     {
-        cv::Mat bgr(src_img->height, src_img->width, CV_8UC3);
-        for (int y = 0; y < src_img->height; y++) {
-            uint8_t* d = bgr.ptr<uint8_t>(y);
-            unsigned char* s = src_img->virt_addr + y * src_img->width * 3;
-            for (int x = 0; x < src_img->width; x++) {
-                d[x*3+0] = s[x*3+2];
-                d[x*3+1] = s[x*3+1];
-                d[x*3+2] = s[x*3+0];
-            }
-        }
+        cv::Mat bgr = rgb_buffer_to_bgr_mat(src_img);
         cv::imwrite(img_path, bgr);
     }
 
@@ -339,64 +315,35 @@ void save_danger_frame(const DangerReport& report,
 
 std::string build_danger_json(const DangerReport& report)
 {
-    char buf[4096];
-    int off = snprintf(buf, sizeof(buf),
-        "{"
-        "\"frame_id\":%d,"
-        "\"balance_alert\":%s,"
-        "\"climbing_alert\":%s,"
-        "\"leaning_alert\":%s,"
-        "\"proximity_alert\":%s,"
-        "\"min_distance_m\":%.3f,"
-        "\"cpu_usage\":%.1f,"
-        "\"npu_usage\":%.1f,"
-        "\"objects\":[",
-        report.frame_id,
-        report.balance_alert ? "true" : "false",
-        report.climbing_alert ? "true" : "false",
-        report.leaning_alert ? "true" : "false",
-        report.proximity_alert ? "true" : "false",
-        report.min_distance_m,
-        report.cpu_usage,
-        report.npu_usage);
+    json j;
+    j["frame_id"] = report.frame_id;
+    j["balance_alert"] = report.balance_alert;
+    j["climbing_alert"] = report.climbing_alert;
+    j["leaning_alert"] = report.leaning_alert;
+    j["proximity_alert"] = report.proximity_alert;
+    j["min_distance_m"] = report.min_distance_m;
+    j["cpu_usage"] = report.cpu_usage;
+    j["npu_usage"] = report.npu_usage;
+    j["objects"] = report.object_names;
 
-    for (size_t i = 0; i < report.object_names.size(); i++) {
-        if (i > 0) off += snprintf(buf + off, sizeof(buf) - off, ",");
-        off += snprintf(buf + off, sizeof(buf) - off, "\"%s\"", report.object_names[i].c_str());
+    json personsArr = json::array();
+    for (const auto& p : report.persons) {
+        json pj;
+        pj["idx"] = p.person_idx;
+        pj["status"] = status_label(p.behavior);
+        pj["theta"] = p.balance_theta;
+        pj["elbow"] = p.elbow_angle;
+        pj["shoulder"] = p.shoulder_angle;
+        pj["knee"] = p.knee_angle;
+        pj["hip"] = p.hip_angle;
+        pj["head_torso"] = p.head_torso_angle;
+        pj["nose_to_win"] = p.nose_to_window_dist;
+        pj["min_dist_m"] = p.min_dist_to_object;
+        pj["kp_3d"] = {p.closest_kp_pt.X, p.closest_kp_pt.Y, p.closest_kp_pt.Z};
+        pj["obj_3d"] = {p.closest_obj_pt.X, p.closest_obj_pt.Y, p.closest_obj_pt.Z};
+        personsArr.push_back(pj);
     }
+    j["persons"] = personsArr;
 
-    off += snprintf(buf + off, sizeof(buf) - off, "],\"persons\":[");
-    for (size_t i = 0; i < report.persons.size(); i++) {
-        if (i > 0) off += snprintf(buf + off, sizeof(buf) - off, ",");
-        const PersonDangerInfo& p = report.persons[i];
-        off += snprintf(buf + off, sizeof(buf) - off,
-            "{"
-            "\"idx\":%d,"
-            "\"status\":\"%s\","
-            "\"theta\":%.1f,"
-            "\"elbow\":%.1f,"
-            "\"shoulder\":%.1f,"
-            "\"knee\":%.1f,"
-            "\"hip\":%.1f,"
-            "\"head_torso\":%.1f,"
-            "\"nose_to_win\":%.3f,"
-            "\"min_dist_m\":%.3f,"
-            "\"kp_3d\":[%.3f,%.3f,%.3f],"
-            "\"obj_3d\":[%.3f,%.3f,%.3f]"
-            "}",
-            p.person_idx,
-            status_label(p.behavior),
-            p.balance_theta,
-            p.elbow_angle,
-            p.shoulder_angle,
-            p.knee_angle,
-            p.hip_angle,
-            p.head_torso_angle,
-            p.nose_to_window_dist,
-            p.min_dist_to_object,
-            p.closest_kp_pt.X, p.closest_kp_pt.Y, p.closest_kp_pt.Z,
-            p.closest_obj_pt.X, p.closest_obj_pt.Y, p.closest_obj_pt.Z);
-    }
-    off += snprintf(buf + off, sizeof(buf) - off, "]}");
-    return std::string(buf);
+    return j.dump();
 }

@@ -11,6 +11,7 @@ import json
 import threading
 import time
 import os
+import hashlib
 import tkinter as tk
 from datetime import datetime
 from tkinter import ttk, messagebox
@@ -41,11 +42,20 @@ PORT = 9527
 MAX_HISTORY = 200
 ACCOUNTS_FILE = "accounts.json"
 
+def _hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
 def _load_accounts():
     if os.path.exists(ACCOUNTS_FILE):
         with open(ACCOUNTS_FILE, "r") as f:
-            return json.load(f)
-    return {"admin": "123456"}
+            data = json.load(f)
+            # upgrade plaintext passwords on first load
+            for u, p in data.items():
+                if len(p) != 64:  # not a SHA256 hash
+                    data[u] = _hash_password(p)
+            _save_accounts(data)
+            return data
+    return {"admin": _hash_password("123456")}
 
 def _save_accounts(acc):
     with open(ACCOUNTS_FILE, "w") as f:
@@ -92,7 +102,7 @@ class HostServer:
             p = pass_var.get()
             if not u or not p:
                 msg.config(text="请输入用户名和密码", fg=FG_ORANGE); return
-            if u in accounts and accounts[u] == p:
+            if u in accounts and accounts[u] == _hash_password(p):
                 result[0] = True
                 login_frame.destroy()
             else:
@@ -107,7 +117,7 @@ class HostServer:
             if len(p) < 4:           msg.config(text="密码至少 4 位", fg=FG_ORANGE); return
             if p != p2:              msg.config(text="两次密码不一致", fg=FG_ORANGE); return
             if u in accounts:        msg.config(text="用户名已存在", fg=FG_ORANGE); return
-            accounts[u] = p
+            accounts[u] = _hash_password(p)
             _save_accounts(accounts)
             msg.config(text=f"账号 {u} 创建成功，请登录", fg=FG_GREEN)
             self.root.after(800, show_login)
@@ -492,9 +502,17 @@ class HostServer:
         try:
             while self.running:
                 meta, jpg1, jpg2 = self._recv_frame(conn)
+                # ignore heartbeat frames (empty JSON + no images)
+                if not jpg1 and not jpg2 and len(meta) <= 2:
+                    self.root.after(0, self._on_heartbeat)
+                    continue
                 self.root.after(0, self._update_ui, meta, jpg1, jpg2)
         except Exception:
             self.root.after(0, self._on_disconnect)
+
+    def _on_heartbeat(self):
+        # silently update connection status, don't add to history
+        pass
 
     # ===================== UI更新 =====================
     def _update_ui(self, meta, jpg1, jpg2, recv_ts=None, add_history=True):

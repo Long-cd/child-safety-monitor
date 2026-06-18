@@ -4,6 +4,7 @@
 #include <string.h>
 #include <thread>
 #include <chrono>
+#include <atomic>
 
 #include "yolov8_pose.h"
 #include "yolov8_seg.h"
@@ -15,6 +16,7 @@
 #include "image_utils.h"
 #include "file_utils.h"
 #include "image_drawing.h"
+#include "image_convert.h"
 
 static int skeleton[38] = {16, 14, 14, 12, 17, 15, 15, 13, 12, 13, 6, 12, 7, 13, 6, 7, 6, 8,
                            7, 9, 8, 10, 9, 11, 2, 3, 1, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 7};
@@ -135,10 +137,10 @@ static void draw_seg_results(image_buffer_t *img, seg_detect_result_list *seg_re
     }
 }
 
-static int run_image_mode(const char* image_path)
+static int run_image_mode(const char* image_path,
+                           const char* pose_model_path,
+                           const char* seg_model_path)
 {
-    const char *pose_model_path = "/home/linaro/projects/yolo_test/model/yolov8_pose.rknn";
-    const char *seg_model_path  = "/home/linaro/projects/yolo_test/model/yolov8_seg.rknn";
 
     rknn_pose_context_t pose_ctx;  memset(&pose_ctx, 0, sizeof(pose_ctx));
     rknn_seg_context_t  seg_ctx;   memset(&seg_ctx,  0, sizeof(seg_ctx));
@@ -185,11 +187,10 @@ out:
 
 static int run_camera_mode(int camId, const std::string& gstPipe,
                            const std::string& calibFile, float scale, bool fastMode,
-                           const std::string& hostIp, int hostPort)
+                           const std::string& hostIp, int hostPort,
+                           const char* pose_model_path,
+                           const char* seg_model_path)
 {
-    const char *pose_model_path = "/home/linaro/projects/yolo_test/model/yolov8_pose.rknn";
-    const char *seg_model_path  = "/home/linaro/projects/yolo_test/model/yolov8_seg.rknn";
-
     StereoCamera stereo;
     if (stereo.init(calibFile, camId, gstPipe, scale, fastMode) != 0) {
         printf("stereo init fail\n");
@@ -224,7 +225,18 @@ static int run_camera_mode(int camId, const std::string& gstPipe,
 
     SysMonitor sysMon;
 
+    // heartbeat thread — sends periodic keepalive to detect disconnect early
+    std::atomic<bool> hbRunning{true};
+    std::thread heartbeatThread([&]() {
+        while (hbRunning) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            if (hbRunning && sender.isConnected())
+                sender.sendHeartbeat();
+        }
+    });
+
     int frameCnt = 0;
+    int reconnectAttempt = 0;
 
     while (true) {
         if (!stereo.grab()) break;
@@ -268,16 +280,7 @@ static int run_camera_mode(int camId, const std::string& gstPipe,
                    dangerRpt.min_distance_m);
 
             // encode annotated image to JPEG
-            cv::Mat annBGR(hh, w, CV_8UC3);
-            for (int y = 0; y < hh; y++) {
-                uint8_t* d = annBGR.ptr<uint8_t>(y);
-                unsigned char* s = src_image.virt_addr + y * w * 3;
-                for (int x = 0; x < w; x++) {
-                    d[x*3+0] = s[x*3+2];
-                    d[x*3+1] = s[x*3+1];
-                    d[x*3+2] = s[x*3+0];
-                }
-            }
+            cv::Mat annBGR = rgb_buffer_to_bgr_mat(&src_image);
             std::vector<uchar> jpg1, jpg2;
             cv::imencode(".jpg", annBGR, jpg1);
 
@@ -295,9 +298,17 @@ static int run_camera_mode(int camId, const std::string& gstPipe,
             dangerRpt.npu_usage = sysMon.npuUsage();
 
             std::string json = build_danger_json(dangerRpt);
-            sender.sendFrame(json,
-                jpg1.data(), (uint32_t)jpg1.size(),
-                jpg2.data(), (uint32_t)jpg2.size());
+            if (sender.sendFrame(json,
+                    jpg1.data(), (uint32_t)jpg1.size(),
+                    jpg2.data(), (uint32_t)jpg2.size()) != 0) {
+                // reconnect on failure
+                if (++reconnectAttempt % 10 == 0) {
+                    printf("[Reconnect] attempting to reconnect to %s:%d...\n", hostIp.c_str(), hostPort);
+                    sender.connect(hostIp, hostPort);
+                }
+            } else {
+                reconnectAttempt = 0;
+            }
         }
 
         // ---- free seg mask ----
@@ -306,18 +317,8 @@ static int run_camera_mode(int camId, const std::string& gstPipe,
             seg_results.results_seg[0].seg_mask = nullptr;
         }
 
-        // ---- build display (w, hh declared above) ----
-
-        cv::Mat display(hh, w, CV_8UC3);
-        for (int y = 0; y < hh; y++) {
-            uint8_t* dst = display.ptr<uint8_t>(y);
-            unsigned char* src = src_image.virt_addr + y * w * 3;
-            for (int x = 0; x < w; x++) {
-                dst[x*3+0] = src[x*3+2];
-                dst[x*3+1] = src[x*3+1];
-                dst[x*3+2] = src[x*3+0];
-            }
-        }
+        // ---- build display ----
+        cv::Mat display = rgb_buffer_to_bgr_mat(&src_image);
 
         // FPS
         char fpsText[64];
@@ -376,6 +377,10 @@ static int run_camera_mode(int camId, const std::string& gstPipe,
         if (key == 27) break;
     }
 
+    hbRunning = false;
+    if (heartbeatThread.joinable())
+        heartbeatThread.join();
+
     cv::destroyAllWindows();
     release_yolov8_seg_model(&seg_ctx);
     release_yolov8_pose_model(&pose_ctx);
@@ -391,34 +396,40 @@ int main(int argc, char **argv)
 
     std::string imagePath;
     std::string gstPipe;
-    std::string calibFile = "/home/linaro/projects/yolo_test/stereo_calib.yaml";
-    std::string hostIp    = "192.168.137.1";
-    int   camId   = 41;
+    std::string calibFile  = "stereo_calib.yaml";
+    std::string poseModel  = "model/yolov8_pose.rknn";
+    std::string segModel   = "model/yolov8_seg.rknn";
+    std::string hostIp     = "192.168.137.1";
+    int   camId    = 41;
     int   hostPort = 9527;
-    float scale   = 0.5f;
+    float scale    = 0.5f;
     bool  fastMode = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--image")            imagePath = argv[++i];
-        else if (a == "-c" || a == "--camera") camId = std::stoi(argv[++i]);
+        if (a == "--image")                imagePath = argv[++i];
+        else if (a == "-c" || a == "--camera")   camId = std::stoi(argv[++i]);
         else if (a == "-p" || a == "--pipeline") gstPipe = argv[++i];
-        else if (a == "-f" || a == "--calib") calibFile = argv[++i];
-        else if (a == "-s" || a == "--scale")  scale = std::stof(argv[++i]);
-        else if (a == "--fast")                fastMode = true;
-        else if (a == "--host")                hostIp = argv[++i];
-        else if (a == "--port")                hostPort = std::stoi(argv[++i]);
+        else if (a == "-f" || a == "--calib")   calibFile = argv[++i];
+        else if (a == "-s" || a == "--scale")   scale = std::stof(argv[++i]);
+        else if (a == "--fast")                  fastMode = true;
+        else if (a == "--host")                  hostIp = argv[++i];
+        else if (a == "--port")                  hostPort = std::stoi(argv[++i]);
+        else if (a == "--pose-model")            poseModel = argv[++i];
+        else if (a == "--seg-model")             segModel = argv[++i];
         else if (a == "-h" || a == "--help") {
             printf("Usage: %s [--image <path>] [options]\n", argv[0]);
-            printf("  --image <path>    Single image mode\n");
-            printf("  -c, --camera <id> Camera device ID (default: 0)\n");
-            printf("  -p, --pipeline    GStreamer pipeline\n");
-            printf("  -f, --calib <f>   Calibration YAML (default: stereo_calib.yaml)\n");
-            printf("  -s, --scale <f>   SGBM scale (default: 0.5)\n");
-            printf("  --fast            Skip WLS filter\n");
-            printf("  --host <ip>       PC server IP (default: 192.168.1.100)\n");
-            printf("  --port <port>     PC server port (default: 9527)\n");
-            printf("  -h, --help        This help\n");
+            printf("  --image <path>      Single image mode\n");
+            printf("  --pose-model <path> Pose model path (default: model/yolov8_pose.rknn)\n");
+            printf("  --seg-model <path>  Seg model path (default: model/yolov8_seg.rknn)\n");
+            printf("  -c, --camera <id>   Camera device ID (default: 41)\n");
+            printf("  -p, --pipeline      GStreamer pipeline\n");
+            printf("  -f, --calib <f>     Calibration YAML (default: stereo_calib.yaml)\n");
+            printf("  -s, --scale <f>     SGBM scale (default: 0.5)\n");
+            printf("  --fast              Skip WLS filter\n");
+            printf("  --host <ip>         PC server IP (default: 192.168.137.1)\n");
+            printf("  --port <port>       PC server port (default: 9527)\n");
+            printf("  -h, --help          This help\n");
             return 0;
         } else {
             imagePath = a; // legacy: first positional arg = image path
@@ -426,8 +437,9 @@ int main(int argc, char **argv)
     }
 
     if (!imagePath.empty()) {
-        return run_image_mode(imagePath.c_str());
+        return run_image_mode(imagePath.c_str(), poseModel.c_str(), segModel.c_str());
     } else {
-        return run_camera_mode(camId, gstPipe, calibFile, scale, fastMode, hostIp, hostPort);
+        return run_camera_mode(camId, gstPipe, calibFile, scale, fastMode, hostIp, hostPort,
+                               poseModel.c_str(), segModel.c_str());
     }
 }

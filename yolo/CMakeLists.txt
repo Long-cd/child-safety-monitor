@@ -42,19 +42,24 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/allocator/dma
     ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/allocator/drm
     ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/rknpu2/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/json
 )
 
-# ---- library search paths ----
-link_directories(${CMAKE_CURRENT_SOURCE_DIR}/rknn_lib)
-link_directories(${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/librga/Linux/aarch64)
-link_directories(${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/jpeg_turbo/Linux/aarch64)
+# ---- library search paths (defaults for RK3588 aarch64) ----
+set(RKNN_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rknn_lib CACHE PATH "RKNN runtime library directory")
+set(RGA_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/librga/Linux/aarch64 CACHE PATH "RGA library directory")
+set(TURBOJPEG_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/jpeg_turbo/Linux/aarch64 CACHE PATH "TurboJPEG library directory")
+
+link_directories(${RKNN_LIB_DIR})
+link_directories(${RGA_LIB_DIR})
+link_directories(${TURBOJPEG_LIB_DIR})
 link_directories(/usr/lib/aarch64-linux-gnu)
 
 # ---- RPATH ----
 set(CMAKE_BUILD_RPATH
-    ${CMAKE_CURRENT_SOURCE_DIR}/rknn_lib
-    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/librga/Linux/aarch64
-    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/jpeg_turbo/Linux/aarch64
+    ${RKNN_LIB_DIR}
+    ${RGA_LIB_DIR}
+    ${TURBOJPEG_LIB_DIR}
     /usr/lib/aarch64-linux-gnu
 )
 

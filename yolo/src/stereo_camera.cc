@@ -1,4 +1,5 @@
 #include "stereo_camera.h"
+#include "image_convert.h"
 #include <iostream>
 #include <cstring>
 
@@ -205,23 +206,7 @@ bool StereoCamera::grab()
 
 void StereoCamera::fillImageBuffer(image_buffer_t* buf)
 {
-    memset(buf, 0, sizeof(*buf));
-    buf->width  = m_rectLcrop.cols;
-    buf->height = m_rectLcrop.rows;
-    buf->format = IMAGE_FORMAT_RGB888;
-    buf->size   = buf->width * buf->height * 3;
-    buf->virt_addr = (unsigned char*)malloc(buf->size);
-
-    // BGR (OpenCV) → RGB (yolo format)
-    for (int y = 0; y < buf->height; y++) {
-        const uint8_t* src = m_rectLcrop.ptr<uint8_t>(y);
-        unsigned char* dst = buf->virt_addr + y * buf->width * 3;
-        for (int x = 0; x < buf->width; x++) {
-            dst[x * 3 + 0] = src[x * 3 + 2]; // R
-            dst[x * 3 + 1] = src[x * 3 + 1]; // G
-            dst[x * 3 + 2] = src[x * 3 + 0]; // B
-        }
-    }
+    bgr_mat_to_rgb_buffer(m_rectLcrop, buf);
 }
 
 void StereoCamera::pixelTo3D(int u, int v, float depth, float& X, float& Y, float& Z) const

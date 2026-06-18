@@ -81,6 +81,7 @@ YOLO_V3.0/
 
 - **RKNN Runtime**: `librknnrt.so` (已包含在 `yolo/rknn_lib/`)
 - **RGA**: Rockchip 图形加速库 (已包含在 `yolo/3rdparty/librga/`)
+- **nlohmann/json**: header-only JSON 库 (已包含在 `yolo/3rdparty/json/`)
 - **OpenCV 4.x**: `sudo apt install libopencv-dev`
 - **CMake 3.10+** / **GCC 9+** (支持 C++17)
 
@@ -159,6 +160,8 @@ python host_server.py
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--image <path>` | 单张图片推理模式 | - |
+| `--pose-model <path>` | 姿态估计模型路径 | model/yolov8_pose.rknn |
+| `--seg-model <path>` | 实例分割模型路径 | model/yolov8_seg.rknn |
 | `-c, --camera <id>` | 相机设备 ID | 41 |
 | `-p, --pipeline` | GStreamer pipeline 字符串 | - |
 | `-f, --calib <file>` | 双目标定 YAML 文件 | stereo_calib.yaml |
@@ -176,15 +179,20 @@ RK3588 → PC 上位机，TCP 二进制帧格式:
 [4字节 JSON长度 (大端)] [JSON 元数据] [4字节 JPEG1长度] [标注图JPEG] [4字节 JPEG2长度] [深度图JPEG]
 ```
 
-JSON 元数据包含: 时间戳、CPU/NPU 使用率、告警状态、人物关键点信息等。
+- **告警帧**: JSON 包含完整的 DangerReport 数据，两个 JPEG 分别为标注图和深度图
+- **心跳帧**: RK3588 每 2 秒发送 `{}` 空 JSON (两个图片长度均为 0)，用于连接保活和断线检测
+- **断线重连**: 发送失败时自动尝试重连，无需手动重启
+
+JSON 元数据包含: 帧ID、CPU/NPU 使用率、告警状态、识别物体列表、人物关键点及 3D 坐标等。
 
 ## 注意事项
 
-1. **模型文件**: 确保 `yolo/model/` 目录下有 `yolov8_pose.rknn` 和 `yolov8_seg.rknn`
+1. **模型文件**: 确保 `yolo/model/` 目录下有 `yolov8_pose.rknn` 和 `yolov8_seg.rknn`，可通过 `--pose-model` / `--seg-model` 指定自定义路径
 2. **RKNN 库**: `yolo/rknn_lib/librknnrt.so` 需与 RK3588 系统的 NPU 驱动版本匹配
+3. **库路径配置**: CMake 构建时可通过 `-DRKNN_LIB_DIR=...` 等参数自定义第三方库路径
 3. **双目相机**: 需要在 `/dev/video*` 下有两个设备节点 (通常 cam41 对应双目相机的左/右拼接设备)
-4. **网络连通**: RK3588 和 PC 需在同一网段，防火墙放行 TCP 9527 端口
-5. **默认密码**: 首次使用请修改 `UI/accounts.json` 中的密码
+4. **网络连通**: RK3588 和 PC 需在同一网段，防火墙放行 TCP 9527 端口。支持断线自动重连和心跳保活
+5. **默认密码**: 首次使用请修改 `UI/accounts.json` 中的密码（SHA256 哈希存储）。默认账号 `admin` 密码 `123456`
 6. **标定文件**: 不同相机需重新标定，`stereo_calib.yaml` 仅适用于标定时的相机
 
 ## License

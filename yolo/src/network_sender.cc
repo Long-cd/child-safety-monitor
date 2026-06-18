@@ -127,3 +127,14 @@ int NetworkSender::sendFrame(const std::string& json,
 
     return 0;
 }
+
+int NetworkSender::sendHeartbeat()
+{
+    if (m_sock < 0) return -1;
+    uint32_t jsonLen = 2;
+    if (sendU32(jsonLen) != 0) return -1;
+    if (sendAll("{}", 2) != 0) return -1;
+    if (sendU32(0) != 0) return -1;
+    if (sendU32(0) != 0) return -1;
+    return 0;
+}
