@@ -1,0 +1,28 @@
+# Build outputs
+yolo/build/
+yolo/utils/build/
+*.o
+*.a
+*.so
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+UI/venv/
+UI/.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Output images (generated at runtime)
+yolo/outputimage/*.jpg
+yolo/outputimage/*.txt
